@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "lambda-deps-builder"
+version = "0.1.0"
+description = "CDK construct that builds Python Lambda dependencies inside Lambda — no local Docker."
+authors = ["POC <noreply@example.com>"]
+readme = "README.md"
+packages = [{ include = "lambda_deps_builder" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+aws-cdk-lib = "^2.150.0"
+constructs = "^10.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+boto3 = "^1.34.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: deploys real AWS resources via cdk; opt in via `pytest -m e2e`",
+]
