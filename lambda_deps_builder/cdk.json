@@ -1,0 +1,21 @@
+{
+  "app": "python -m lambda_deps_builder.example.app",
+  "watch": {
+    "include": ["**"],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "**/__pycache__",
+      "tests",
+      "poetry.lock",
+      "pyproject.toml",
+      ".venv"
+    ]
+  },
+  "context": {
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:target-partitions": ["aws", "aws-cn"]
+  }
+}
