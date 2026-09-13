@@ -1,0 +1,73 @@
+name: CI Lambda Deps Builder
+
+on:
+  push:
+    branches:
+      - '*'
+    paths:
+      - 'lambda_deps_builder/**'
+      - '.github/workflows/*lambda-deps*'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'lambda_deps_builder/**'
+      - '.github/workflows/*lambda-deps*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies and package
+        run: |
+          python -m pip install --upgrade pip
+          pip install ./lambda_deps_builder
+          pip install pytest boto3
+
+      - name: Run unit & synth tests
+        run: |
+          pytest lambda_deps_builder/tests -v
+
+  build-check:
+    name: Verify package build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build wheel and sdist
+        run: |
+          python -m build --sdist --wheel lambda_deps_builder --outdir dist
+
+      - name: Check distributions with twine
+        run: |
+          twine check dist/*
