@@ -59,7 +59,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
-    if: (!inputs.dry-run)
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry-run }}
     steps:
       - name: Download distribution artifacts
         uses: actions/download-artifact@v4
@@ -67,15 +67,26 @@ jobs:
           name: python-package-distributions
           path: dist/
 
+      - name: Check for PyPI API token
+        id: token-check
+        env:
+          TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to PyPI (Trusted Publishing OIDC)
-        if: ${{ secrets.PYPI_API_TOKEN == '' }}
+        if: steps.token-check.outputs.has_token == 'false'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
           skip-existing: true
 
       - name: Publish to PyPI (API Token fallback)
-        if: ${{ secrets.PYPI_API_TOKEN != '' }}
+        if: steps.token-check.outputs.has_token == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
