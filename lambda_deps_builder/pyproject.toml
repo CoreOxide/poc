@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "lambda-deps-builder"
-version = "0.1.0"
+version = "0.2.0"
 description = "CDK construct that builds Python Lambda dependencies inside Lambda — no local Docker."
 authors = ["Alexy Grabov <alexy.grabov@gmail.com>"]
 license = "Apache-2.0"
