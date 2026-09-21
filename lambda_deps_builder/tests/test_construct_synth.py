@@ -317,6 +317,108 @@ def test_missing_requirements_file_raises(tmp_path: Path) -> None:
         )
 
 
+def test_default_uses_uv_engine(tmp_requirements_file: Path) -> None:
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+        )
+        assert b.build_engine == "uv"
+        assert b.uv_package_spec == "uv"
+        assert b.fallback_to_pip is True
+
+    template = _synth_stack(factory)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "BUILD_ENGINE": "uv",
+                            "UV_PACKAGE_SPEC": "uv",
+                            "FALLBACK_TO_PIP": "1",
+                        }
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_custom_engine_configuration(tmp_requirements_file: Path) -> None:
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            build_engine="pip",
+            uv_package_spec="uv>=0.5",
+            fallback_to_pip=False,
+        )
+        assert b.build_engine == "pip"
+        assert b.uv_package_spec == "uv>=0.5"
+        assert b.fallback_to_pip is False
+
+    template = _synth_stack(factory)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "BUILD_ENGINE": "pip",
+                            "UV_PACKAGE_SPEC": "uv>=0.5",
+                            "FALLBACK_TO_PIP": "0",
+                        }
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_invalid_build_engine_raises(tmp_requirements_file: Path) -> None:
+    app = cdk.App()
+    stack = Stack(app, "BadEngine")
+    with pytest.raises(ValueError, match="build_engine must be 'uv' or 'pip'"):
+        LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            build_engine="unsupported",
+        )
+
+
+def test_bundled_uv_binary_staged(tmp_requirements_file: Path, tmp_path: Path) -> None:
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("binary content")
+
+    app = cdk.App()
+    stack = Stack(app, "Bundled")
+    b = LambdaDepsBuilder(
+        stack,
+        "Deps",
+        requirements_txt_file=tmp_requirements_file,
+        uv_binary_path=fake_uv,
+    )
+    assert b.trigger is not None
+
+
+def test_missing_uv_binary_raises(tmp_requirements_file: Path, tmp_path: Path) -> None:
+    app = cdk.App()
+    stack = Stack(app, "BadUv")
+    with pytest.raises(FileNotFoundError, match="uv_binary_path does not exist"):
+        LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            uv_binary_path=tmp_path / "does-not-exist-uv",
+        )
+
+
 def _iter_resource_entries(resource):
     if resource is None:
         return

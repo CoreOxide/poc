@@ -41,10 +41,22 @@ def _resolve_region() -> str:
     )
 
 
+def _resolve_cdk_cmd() -> list[str] | None:
+    """Locate the CDK CLI command, checking PATH for cdk or npx."""
+    cdk_bin = shutil.which("cdk")
+    if cdk_bin is not None:
+        return [cdk_bin]
+    npx_bin = shutil.which("npx")
+    if npx_bin is not None:
+        return [npx_bin, "cdk"]
+    return None
+
+
 @pytest.fixture(scope="module")
 def deployed_stack() -> Iterator[dict]:
-    if shutil.which("cdk") is None:
-        pytest.skip("cdk CLI not on PATH")
+    cdk_cmd = _resolve_cdk_cmd()
+    if cdk_cmd is None:
+        pytest.skip("Neither cdk nor npx CLI on PATH")
 
     region = _resolve_region()
     stack_name = f"LambdaDepsBuilderE2E-{uuid.uuid4().hex[:8]}"
@@ -57,10 +69,10 @@ def deployed_stack() -> Iterator[dict]:
 
     deployed = False
     try:
-        print(f"\n[E2E] deploying stack {stack_name} in {region} ...")
+        print(f"\n[E2E] deploying stack {stack_name} in {region} using {' '.join(cdk_cmd)} ...")
         deploy_start = time.monotonic()
         subprocess.run(
-            ["cdk", "deploy", "--require-approval", "never", "--ci"],
+            [*cdk_cmd, "deploy", "--require-approval", "never", "--ci"],
             cwd=_PROJECT_DIR,
             env=env,
             check=True,
@@ -77,10 +89,10 @@ def deployed_stack() -> Iterator[dict]:
         }
         yield {"stack_name": stack_name, "outputs": outputs, "region": region}
     finally:
-        if deployed or shutil.which("cdk") is not None:
+        if deployed or cdk_cmd is not None:
             print(f"\n[E2E] destroying stack {stack_name} ...")
             subprocess.run(
-                ["cdk", "destroy", "--force", "--ci"],
+                [*cdk_cmd, "destroy", "--force", "--ci"],
                 cwd=_PROJECT_DIR,
                 env=env,
                 check=False,
