@@ -29,7 +29,8 @@ deploy ──> 1. CFN creates bucket
                                 uv pip install -r requirements.txt --target /tmp/build/python
                                 (10x faster than pip; automatic fallback to pip if needed)
                                 zip /tmp/build  →  /tmp/deps.zip
-                                s3.put_object(Bucket=..., Key=deps-X.zip)
+                                analyzer.py inspects .dist-info & sizes → layer-analysis.html
+                                s3.put_object(Bucket=..., Key=deps-X.zip & layer-analysis-X.html)
            4. CFN creates LayerVersion (depends_on the trigger) → reads zip from S3
            5. Consumer Function(architecture=X, layers=[layer]) runs with matching deps
 ```
@@ -47,6 +48,30 @@ By default, `LambdaDepsBuilder` uses **Astral `uv`** inside the trigger Lambda. 
 | Heavy scientific / crypto stack | ~55s | **~5.1s** | **11x** |
 
 If `uv` bootstrapping or installation encounters an issue, `fallback_to_pip=True` ensures seamless automatic fallback to standard `pip`.
+
+## Interactive Layer Size Visualizer (HTML Treemap)
+
+During each build, `LambdaDepsBuilder` analyzes the installed `/tmp/build/python` directory using `.dist-info/METADATA` and `RECORD` manifests, generates a **self-contained interactive HTML treemap** (zero external CDN dependencies), and uploads it to S3 alongside your layer zip:
+
+- **250 MB AWS Lambda Quota Bar**: visual headroom indicator against the 262,144,000-byte unzipped limit.
+- **Interactive Squarified Treemap**: click any package or subdirectory to drill down, hover for exact byte/quota/native-binary tooltips, and filter live by package or file name.
+- **Sortable Package Breakdown Table**: compare unzipped size, `% of layer`, file counts, and compiled `.so` / `.pyd` native binary share.
+- **CloudFormation Output**: exposes `LayerAnalysisReportUri` (`s3://<bucket>/layer-analysis-<arch>-<id>.html`) and `builder.report_s3_uri`.
+
+Download and open the report locally after `cdk deploy`:
+
+```shell
+aws s3 cp "$(aws cloudformation describe-stacks \
+  --stack-name MyStack \
+  --query "Stacks[0].Outputs[?OutputKey=='DepsLayerAnalysisReportUri'].OutputValue" \
+  --output text)" ./layer-analysis.html
+```
+
+Configuration options on `LambdaDepsBuilder`:
+
+- `generate_size_report: bool = True` — set to `False` to skip analysis and HTML upload.
+- `report_output_key: Optional[str] = None` — override the default `layer-analysis-{ARCH}-{construct_id}.html` S3 key.
+- `emit_report_cfn_output: bool = True` — set to `False` to suppress the `LayerAnalysisReportUri` `CfnOutput`.
 
 ## Usage
 

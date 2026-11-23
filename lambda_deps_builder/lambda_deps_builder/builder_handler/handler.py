@@ -2,14 +2,21 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import boto3
+
+try:
+    from . import analyzer
+except ImportError:  # pragma: no cover - flat Lambda /var/task layout
+    import analyzer  # type: ignore[no-redef]
 
 _REQUIREMENTS_FILE = Path("/var/task/requirements.txt")
 _BUILD_ROOT = Path("/tmp/build")
 _ZIP_BASE = Path("/tmp/deps")
 _ZIP_PATH = _ZIP_BASE.with_suffix(".zip")
+_REPORT_PATH = Path("/tmp/layer-analysis.html")
 
 _BUNDLED_UV = Path("/var/task/bin/uv")
 _WARM_UV_DIR = Path("/tmp/uv_tool")
@@ -155,6 +162,16 @@ def handler(event, context):
     build_engine = os.environ.get("BUILD_ENGINE", "uv").lower()
     uv_package_spec = os.environ.get("UV_PACKAGE_SPEC", "uv")
     fallback_to_pip = os.environ.get("FALLBACK_TO_PIP", "1").lower() in ("1", "true", "yes")
+    generate_size_report = os.environ.get("GENERATE_SIZE_REPORT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    report_object_key = os.environ.get("REPORT_OBJECT_KEY", "")
+    target_runtime = os.environ.get("TARGET_RUNTIME", "")
+    target_architecture = os.environ.get("TARGET_ARCHITECTURE", "")
+
+    start_time = time.monotonic()
 
     # Warm-container reuse can leave previous installs on /tmp; start clean so the
     # produced zip reflects only the current requirements.txt.
@@ -188,13 +205,54 @@ def handler(event, context):
             "pip install produced no files; requirements.txt is empty or matched no packages"
         )
 
+    should_report = generate_size_report and bool(report_object_key)
+    analysis = analyzer.analyze_directory(target) if should_report else None
+
     shutil.make_archive(str(_ZIP_BASE), "zip", root_dir=str(_BUILD_ROOT), base_dir="python")
+    zip_size = _ZIP_PATH.stat().st_size
 
-    boto3.client("s3").upload_file(str(_ZIP_PATH), bucket_name, object_key)
+    s3_client = boto3.client("s3")
+    s3_client.upload_file(str(_ZIP_PATH), bucket_name, object_key)
 
-    return {
+    result = {
         "bucket": bucket_name,
         "key": object_key,
-        "size": _ZIP_PATH.stat().st_size,
+        "size": zip_size,
         "engine": used_engine,
     }
+
+    if should_report and analysis is not None:
+        duration_sec = round(time.monotonic() - start_time, 2)
+        html_report = analyzer.render_treemap_html(
+            analysis,
+            zip_bytes=zip_size,
+            metadata={
+                "runtime": target_runtime,
+                "architecture": target_architecture,
+                "engine": used_engine,
+                "build_duration_sec": duration_sec,
+                "bucket": bucket_name,
+                "object_key": object_key,
+            },
+        )
+        _REPORT_PATH.write_text(html_report, encoding="utf-8")
+        s3_client.upload_file(
+            str(_REPORT_PATH),
+            bucket_name,
+            report_object_key,
+            ExtraArgs={"ContentType": "text/html; charset=utf-8"},
+        )
+        unzipped_mb = analysis["total_unzipped_bytes"] / (1024 * 1024)
+        zipped_mb = zip_size / (1024 * 1024)
+        print(
+            f"[INFO] Layer size: {unzipped_mb:.2f} MB unzipped "
+            f"({analysis['quota_percent']}% of 250 MB limit), "
+            f"{zipped_mb:.2f} MB zipped across {analysis['package_count']} packages. "
+            f"Report: s3://{bucket_name}/{report_object_key} "
+            f"(download: aws s3 cp s3://{bucket_name}/{report_object_key} ./layer-analysis.html)"
+        )
+        result["report_key"] = report_object_key
+        result["unzipped_size"] = analysis["total_unzipped_bytes"]
+        result["package_count"] = analysis["package_count"]
+
+    return result

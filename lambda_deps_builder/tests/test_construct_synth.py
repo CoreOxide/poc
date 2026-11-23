@@ -419,6 +419,162 @@ def test_missing_uv_binary_raises(tmp_requirements_file: Path, tmp_path: Path) -
         )
 
 
+def test_default_enables_size_report_with_iam_and_cfn_output(
+    tmp_requirements_file: Path,
+) -> None:
+    captured: dict = {}
+
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+        )
+        captured["builder"] = b
+
+    template = _synth_stack(factory)
+    b = captured["builder"]
+
+    assert b.generate_size_report is True
+    assert b.report_key == "layer-analysis-x86_64-Deps.html"
+    assert b.report_s3_uri is not None and b.report_s3_uri.endswith(
+        "/layer-analysis-x86_64-Deps.html"
+    )
+
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "GENERATE_SIZE_REPORT": "1",
+                            "REPORT_OBJECT_KEY": "layer-analysis-x86_64-Deps.html",
+                            "TARGET_RUNTIME": "python3.12",
+                            "TARGET_ARCHITECTURE": "x86_64",
+                        }
+                    )
+                }
+            }
+        ),
+    )
+
+    s3_keys: set = set()
+    for policy in template.find_resources("AWS::IAM::Policy").values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = statement.get("Action")
+            actions = actions if isinstance(actions, list) else [actions]
+            if "s3:PutObject" not in actions:
+                continue
+            for resource_entry in _iter_resource_entries(statement.get("Resource")):
+                key = _extract_object_key(resource_entry)
+                if key is not None:
+                    s3_keys.add(key)
+    assert {"deps-x86_64-Deps.zip", "layer-analysis-x86_64-Deps.html"}.issubset(s3_keys)
+
+    outputs = template.to_json().get("Outputs", {})
+    assert any(k.startswith("DepsLayerAnalysisReportUri") for k in outputs)
+
+
+def test_disable_size_report_omits_env_and_output(tmp_requirements_file: Path) -> None:
+    captured: dict = {}
+
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            generate_size_report=False,
+        )
+        captured["builder"] = b
+
+    template = _synth_stack(factory)
+    b = captured["builder"]
+
+    assert b.generate_size_report is False
+    assert b.report_key is None
+    assert b.report_s3_uri is None
+
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "GENERATE_SIZE_REPORT": "0",
+                        }
+                    )
+                }
+            }
+        ),
+    )
+    outputs = template.to_json().get("Outputs", {})
+    assert not any("LayerAnalysisReportUri" in k for k in outputs)
+
+
+def test_custom_report_output_key_and_suppressed_cfn_output(
+    tmp_requirements_file: Path,
+) -> None:
+    captured: dict = {}
+
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            report_output_key="reports/custom.html",
+            emit_report_cfn_output=False,
+        )
+        captured["builder"] = b
+
+    template = _synth_stack(factory)
+    assert captured["builder"].report_key == "reports/custom.html"
+
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {"REPORT_OBJECT_KEY": "reports/custom.html"}
+                    )
+                }
+            }
+        ),
+    )
+    outputs = template.to_json().get("Outputs", {})
+    assert not any("LayerAnalysisReportUri" in k for k in outputs)
+
+
+def test_sibling_builders_get_distinct_report_keys(tmp_requirements_file: Path) -> None:
+    app = cdk.App()
+    stack = Stack(app, "Siblings")
+    bucket = s3.Bucket(stack, "Shared")
+    b1 = LambdaDepsBuilder(
+        stack,
+        "ApiDeps",
+        requirements_txt_file=tmp_requirements_file,
+        deps_bucket=bucket,
+    )
+    b2 = LambdaDepsBuilder(
+        stack,
+        "WorkerDeps",
+        requirements_txt_file=tmp_requirements_file,
+        deps_bucket=bucket,
+    )
+    assert b1.report_key != b2.report_key
+
+
+def test_stage_handler_asset_includes_analyzer(tmp_requirements_file: Path) -> None:
+    from lambda_deps_builder.construct import _stage_handler_asset
+
+    staged = Path(_stage_handler_asset(tmp_requirements_file))
+    assert (staged / "handler.py").is_file()
+    assert (staged / "analyzer.py").is_file()
+    assert (staged / "requirements.txt").is_file()
+
+
 def _iter_resource_entries(resource):
     if resource is None:
         return
