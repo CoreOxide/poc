@@ -566,13 +566,116 @@ def test_sibling_builders_get_distinct_report_keys(tmp_requirements_file: Path) 
     assert b1.report_key != b2.report_key
 
 
-def test_stage_handler_asset_includes_analyzer(tmp_requirements_file: Path) -> None:
+def test_stage_handler_asset_includes_analyzer_and_slimmer(
+    tmp_requirements_file: Path,
+) -> None:
     from lambda_deps_builder.construct import _stage_handler_asset
 
     staged = Path(_stage_handler_asset(tmp_requirements_file))
     assert (staged / "handler.py").is_file()
     assert (staged / "analyzer.py").is_file()
+    assert (staged / "slimmer.py").is_file()
     assert (staged / "requirements.txt").is_file()
+
+
+def test_default_slimming_env_vars_and_properties(tmp_requirements_file: Path) -> None:
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+        )
+        assert b.slim_layer is True
+        assert b.strip_binaries is True
+        assert b.prune_tests is True
+        assert b.prune_dist_info is False
+        assert b.exclude_patterns == []
+
+    template = _synth_stack(factory)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "SLIM_LAYER": "1",
+                            "STRIP_BINARIES": "1",
+                            "PRUNE_TESTS": "1",
+                            "PRUNE_DIST_INFO": "0",
+                            "EXCLUDE_PATTERNS": "[]",
+                        }
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_custom_slimming_configuration_propagates(tmp_requirements_file: Path) -> None:
+    def factory(stack: Stack) -> None:
+        b = LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            slim_layer=False,
+            strip_binaries=False,
+            prune_tests=False,
+            prune_dist_info=True,
+            exclude_patterns=["boto3*", "*.csv"],
+        )
+        assert b.slim_layer is False
+        assert b.strip_binaries is False
+        assert b.prune_tests is False
+        assert b.prune_dist_info is True
+        assert b.exclude_patterns == ["boto3*", "*.csv"]
+
+    template = _synth_stack(factory)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        Match.object_like(
+            {
+                "Environment": {
+                    "Variables": Match.object_like(
+                        {
+                            "SLIM_LAYER": "0",
+                            "STRIP_BINARIES": "0",
+                            "PRUNE_TESTS": "0",
+                            "PRUNE_DIST_INFO": "1",
+                            "EXCLUDE_PATTERNS": '["boto3*", "*.csv"]',
+                        }
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_bundled_strip_binary_staged(tmp_requirements_file: Path, tmp_path: Path) -> None:
+    fake_strip = tmp_path / "strip"
+    fake_strip.write_text("binary content")
+
+    app = cdk.App()
+    stack = Stack(app, "BundledStrip")
+    b = LambdaDepsBuilder(
+        stack,
+        "Deps",
+        requirements_txt_file=tmp_requirements_file,
+        strip_binary_path=fake_strip,
+    )
+    assert b.trigger is not None
+
+
+def test_missing_strip_binary_raises(tmp_requirements_file: Path, tmp_path: Path) -> None:
+    app = cdk.App()
+    stack = Stack(app, "BadStrip")
+    with pytest.raises(FileNotFoundError, match="strip_binary_path does not exist"):
+        LambdaDepsBuilder(
+            stack,
+            "Deps",
+            requirements_txt_file=tmp_requirements_file,
+            strip_binary_path=tmp_path / "does-not-exist-strip",
+        )
 
 
 def _iter_resource_entries(resource):
