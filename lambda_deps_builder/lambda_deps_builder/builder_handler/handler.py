@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -12,6 +13,11 @@ try:
 except ImportError:  # pragma: no cover - flat Lambda /var/task layout
     import analyzer  # type: ignore[no-redef]
 
+try:
+    from . import slimmer
+except ImportError:  # pragma: no cover - flat Lambda /var/task layout
+    import slimmer  # type: ignore[no-redef]
+
 _REQUIREMENTS_FILE = Path("/var/task/requirements.txt")
 _BUILD_ROOT = Path("/tmp/build")
 _ZIP_BASE = Path("/tmp/deps")
@@ -23,6 +29,10 @@ _WARM_UV_DIR = Path("/tmp/uv_tool")
 _WARM_UV_BIN = _WARM_UV_DIR / "bin" / "uv"
 _STAGE_UV_DIR = Path("/tmp/uv_bin")
 _STAGE_UV_BIN = _STAGE_UV_DIR / "uv"
+
+_BUNDLED_STRIP = Path("/var/task/bin/strip")
+_STAGE_STRIP_DIR = Path("/tmp/strip_bin")
+_STAGE_STRIP_BIN = _STAGE_STRIP_DIR / "strip"
 
 
 def _resolve_uv_binary(uv_package_spec: str) -> Path:
@@ -148,25 +158,40 @@ def _run_pip_install(target: Path) -> None:
     )
 
 
+def _parse_bool_env(name: str, default: str) -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+
+def _parse_exclude_patterns(raw: str) -> list[str]:
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+        raise ValueError(
+            f"EXCLUDE_PATTERNS must be a JSON array of strings, got {type(parsed).__name__}"
+        )
+    return parsed
+
+
 def handler(event, context):
     """
     Lambda entry point. Installs the bundled requirements.txt into a layer-shaped
-    directory, zips it, and uploads to S3 at the bucket/key supplied via environment.
+    directory, optionally slims & strips binaries, zips it, and uploads to S3 at
+    the bucket/key supplied via environment.
 
     :param event: Lambda invocation event (unused).
     :param context: Lambda context (unused).
-    :return: `{"bucket": ..., "key": ..., "size": <bytes>, "engine": <str>}`.
+    :return: `{"bucket": ..., "key": ..., "size": <bytes>, "engine": <str>, "slim": <dict>}`.
     """
     bucket_name = os.environ["BUCKET_NAME"]
     object_key = os.environ["OBJECT_KEY"]
     build_engine = os.environ.get("BUILD_ENGINE", "uv").lower()
     uv_package_spec = os.environ.get("UV_PACKAGE_SPEC", "uv")
-    fallback_to_pip = os.environ.get("FALLBACK_TO_PIP", "1").lower() in ("1", "true", "yes")
-    generate_size_report = os.environ.get("GENERATE_SIZE_REPORT", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    fallback_to_pip = _parse_bool_env("FALLBACK_TO_PIP", "1")
+    slim_layer = _parse_bool_env("SLIM_LAYER", "1")
+    strip_binaries = _parse_bool_env("STRIP_BINARIES", "1")
+    prune_tests = _parse_bool_env("PRUNE_TESTS", "1")
+    prune_dist_info = _parse_bool_env("PRUNE_DIST_INFO", "0")
+    exclude_patterns = _parse_exclude_patterns(os.environ.get("EXCLUDE_PATTERNS", "[]"))
+    generate_size_report = _parse_bool_env("GENERATE_SIZE_REPORT", "0")
     report_object_key = os.environ.get("REPORT_OBJECT_KEY", "")
     target_runtime = os.environ.get("TARGET_RUNTIME", "")
     target_architecture = os.environ.get("TARGET_ARCHITECTURE", "")
@@ -205,6 +230,35 @@ def handler(event, context):
             "pip install produced no files; requirements.txt is empty or matched no packages"
         )
 
+    if slim_layer:
+        slim_stats = slimmer.slim_directory(
+            target,
+            strip_binaries=strip_binaries,
+            prune_tests=prune_tests,
+            prune_dist_info=prune_dist_info,
+            exclude_patterns=exclude_patterns,
+            bundled_strip_path=_BUNDLED_STRIP,
+            stage_strip_path=_STAGE_STRIP_BIN,
+        )
+    else:
+        uncompressed_size = slimmer.calculate_dir_size(target)
+        slim_stats = {
+            "enabled": False,
+            "uncompressed_before_bytes": uncompressed_size,
+            "uncompressed_after_bytes": uncompressed_size,
+            "saved_bytes": 0,
+            "reduction_percent": 0.0,
+            "binaries_stripped": 0,
+            "strip_available": False,
+            "breakdown_bytes": {
+                "bytecode": 0,
+                "tests": 0,
+                "docs_and_meta": 0,
+                "custom_excludes": 0,
+                "stripped_binaries": 0,
+            },
+        }
+
     should_report = generate_size_report and bool(report_object_key)
     analysis = analyzer.analyze_directory(target) if should_report else None
 
@@ -219,6 +273,7 @@ def handler(event, context):
         "key": object_key,
         "size": zip_size,
         "engine": used_engine,
+        "slim": slim_stats,
     }
 
     if should_report and analysis is not None:

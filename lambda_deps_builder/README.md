@@ -28,6 +28,7 @@ deploy ──> 1. CFN creates bucket
                                 Astral `uv` bootstraps in /tmp & parallel downloads wheels:
                                 uv pip install -r requirements.txt --target /tmp/build/python
                                 (10x faster than pip; automatic fallback to pip if needed)
+                                slim_directory(): prune bytecode/tests/docs + strip *.so*
                                 zip /tmp/build  →  /tmp/deps.zip
                                 analyzer.py inspects .dist-info & sizes → layer-analysis.html
                                 s3.put_object(Bucket=..., Key=deps-X.zip & layer-analysis-X.html)
@@ -73,6 +74,21 @@ Configuration options on `LambdaDepsBuilder`:
 - `report_output_key: Optional[str] = None` — override the default `layer-analysis-{ARCH}-{construct_id}.html` S3 key.
 - `emit_report_cfn_output: bool = True` — set to `False` to suppress the `LayerAnalysisReportUri` `CfnOutput`.
 
+## Automatic Layer Slimming & Binary Symbol Stripping
+
+AWS Lambda layers have a hard **250 MB unzipped limit** (`262,144,000` bytes). By default (`slim_layer=True`), `LambdaDepsBuilder` automatically optimizes the installed `/tmp/build/python` tree before analyzing and zipping:
+
+- **Prunes non-runtime bloat**: `__pycache__`, `*.pyc`, `*.pyo`, package `tests/` and `test/` folders (preserving `testing/` such as `numpy.testing`), `docs/`/`examples/`, type stubs (`*.pyi`), C/C++/Cython headers/sources (`*.c`, `*.h`, `*.pxd`, `*.a`, `*.o`), and standalone docs/licenses (`README*`, `LICENSE*`, `*.md`, `*.rst`).
+- **Strips native ELF binaries**: Runs `strip --strip-unneeded` on `.so` / `.so.*` shared libraries when `strip` is available (via `PATH` or an optional bundled `strip_binary_path`), gracefully skipping with an info log if `strip` is absent from the minimal Lambda runtime.
+- **Preserves runtime metadata safely**: `prune_dist_info` defaults to `False` so `importlib.metadata.version()` and `entry_points()` continue working for `fastapi`, `pydantic`, `botocore`, and `opentelemetry` (set `prune_dist_info=True` for maximum size reduction).
+- **Custom exclusions**: Pass `exclude_patterns=["boto3*", "*.csv"]` to strip additional globs.
+
+Each deploy logs a CloudWatch breakdown of space saved and warns if the unzipped layer still exceeds 250 MB:
+
+```text
+[INFO] Layer slimming complete: 195.40 MB -> 112.10 MB (42.6% reduction, saved 83.30 MB)
+       breakdown: bytecode=18.20 MB, tests=24.50 MB, docs_meta=6.40 MB, stripped_so=34.20 MB (47 binaries), custom=0.00 MB
+```
 ## Usage
 
 ```python

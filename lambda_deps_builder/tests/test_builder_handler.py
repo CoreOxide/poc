@@ -35,6 +35,9 @@ def _patch_build_paths(
     stage_uv_bin = stage_uv_dir / "uv"
     bundled_uv = tmp_path / "bundled_uv"
     report_path = tmp_path / "layer-analysis.html"
+    bundled_strip = tmp_path / "bundled_strip"
+    stage_strip_dir = tmp_path / "strip_bin"
+    stage_strip_bin = stage_strip_dir / "strip"
 
     monkeypatch.setattr(handler_module, "_BUILD_ROOT", build_root)
     monkeypatch.setattr(handler_module, "_ZIP_BASE", zip_base)
@@ -45,6 +48,9 @@ def _patch_build_paths(
     monkeypatch.setattr(handler_module, "_STAGE_UV_BIN", stage_uv_bin)
     monkeypatch.setattr(handler_module, "_BUNDLED_UV", bundled_uv)
     monkeypatch.setattr(handler_module, "_REPORT_PATH", report_path)
+    monkeypatch.setattr(handler_module, "_BUNDLED_STRIP", bundled_strip)
+    monkeypatch.setattr(handler_module, "_STAGE_STRIP_DIR", stage_strip_dir)
+    monkeypatch.setattr(handler_module, "_STAGE_STRIP_BIN", stage_strip_bin)
     return zip_path, warm_uv_bin, stage_uv_bin, bundled_uv
 
 
@@ -138,12 +144,11 @@ def test_handler_uses_uv_by_default_bootstraps_and_installs(
     assert any(n == "python/fakepkg/__init__.py" for n in names)
     assert all(n.startswith("python/") or n == "python/" for n in names)
 
-    assert result == {
-        "bucket": "my-bucket",
-        "key": "deps.zip",
-        "size": zip_path.stat().st_size,
-        "engine": "uv",
-    }
+    assert result["bucket"] == "my-bucket"
+    assert result["key"] == "deps.zip"
+    assert result["size"] == zip_path.stat().st_size
+    assert result["engine"] == "uv"
+    assert result["slim"]["enabled"] is True
 
 
 def test_handler_reuses_warm_uv_binary(
@@ -484,4 +489,84 @@ def test_handler_skips_size_report_when_disabled(
     assert "report_key" not in result
     assert not (tmp_path / "layer-analysis.html").exists()
 
+
+def test_handler_slims_layer_by_default_and_respects_exclude_patterns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_boto3: MagicMock,
+    handler_module,
+) -> None:
+    zip_path, warm_uv_bin, _, _ = _patch_build_paths(monkeypatch, handler_module, tmp_path)
+    monkeypatch.setenv("BUCKET_NAME", "b")
+    monkeypatch.setenv("OBJECT_KEY", "k")
+    monkeypatch.setenv("BUILD_ENGINE", "pip")
+    monkeypatch.setenv("EXCLUDE_PATTERNS", '["*.csv"]')
+
+    def fake_run(cmd, check, env):
+        return _fake_run(
+            cmd,
+            check,
+            env,
+            fixture_files={
+                "pkg/__init__.py": "OK\n",
+                "pkg/__pycache__/mod.cpython-312.pyc": "BYTECODE",
+                "pkg/tests/test_pkg.py": "TEST",
+                "pkg/data.csv": "a,b,c\n",
+            },
+            warm_uv_bin=warm_uv_bin,
+        )
+
+    monkeypatch.setattr(handler_module.subprocess, "run", fake_run)
+    fake_boto3.client.return_value = MagicMock()
+
+    result = handler_module.handler({}, None)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+
+    assert "python/pkg/__init__.py" in names
+    assert not any("__pycache__" in n for n in names)
+    assert not any("/tests/" in n for n in names)
+    assert not any(n.endswith("data.csv") for n in names)
+    assert result["slim"]["enabled"] is True
+    assert result["slim"]["saved_bytes"] > 0
+
+
+def test_handler_skips_slimming_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_boto3: MagicMock,
+    handler_module,
+) -> None:
+    zip_path, warm_uv_bin, _, _ = _patch_build_paths(monkeypatch, handler_module, tmp_path)
+    monkeypatch.setenv("BUCKET_NAME", "b")
+    monkeypatch.setenv("OBJECT_KEY", "k")
+    monkeypatch.setenv("BUILD_ENGINE", "pip")
+    monkeypatch.setenv("SLIM_LAYER", "0")
+
+    def fake_run(cmd, check, env):
+        return _fake_run(
+            cmd,
+            check,
+            env,
+            fixture_files={
+                "pkg/__init__.py": "OK\n",
+                "pkg/__pycache__/mod.cpython-312.pyc": "BYTECODE",
+                "pkg/tests/test_pkg.py": "TEST",
+            },
+            warm_uv_bin=warm_uv_bin,
+        )
+
+    monkeypatch.setattr(handler_module.subprocess, "run", fake_run)
+    fake_boto3.client.return_value = MagicMock()
+
+    result = handler_module.handler({}, None)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+
+    assert "python/pkg/__pycache__/mod.cpython-312.pyc" in names
+    assert "python/pkg/tests/test_pkg.py" in names
+    assert result["slim"]["enabled"] is False
+    assert result["slim"]["saved_bytes"] == 0
 

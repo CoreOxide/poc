@@ -1,4 +1,5 @@
 import atexit
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -55,6 +56,19 @@ class LambdaDepsBuilder(Construct):
         ``layer-analysis-{ARCH}-{construct_id}.html``.
     :param emit_report_cfn_output: whether to emit a CloudFormation Output containing the
         S3 URI of the generated HTML treemap report. Defaults to True.
+    :param slim_layer: whether to automatically prune non-runtime bloat (bytecode caches,
+        tests, docs, stubs) before zipping. Defaults to True.
+    :param strip_binaries: whether to run ``strip --strip-unneeded`` on ``.so`` shared
+        libraries when a ``strip`` binary is available. Defaults to True.
+    :param strip_binary_path: optional local path to a Linux ``strip`` binary to bundle
+        into the Lambda asset at ``bin/strip``.
+    :param prune_tests: whether to remove ``tests/`` and ``test/`` directories during
+        slimming (preserves ``testing/``). Defaults to True.
+    :param prune_dist_info: whether to remove ``*.dist-info`` and ``*.egg-info``
+        metadata directories during slimming. Defaults to False to preserve
+        ``importlib.metadata``.
+    :param exclude_patterns: optional list of glob patterns (matched against relative
+        POSIX paths or basenames) to remove during slimming.
     """
 
     def __init__(
@@ -77,6 +91,12 @@ class LambdaDepsBuilder(Construct):
         generate_size_report: bool = True,
         report_output_key: Optional[str] = None,
         emit_report_cfn_output: bool = True,
+        slim_layer: bool = True,
+        strip_binaries: bool = True,
+        strip_binary_path: Optional[Path] = None,
+        prune_tests: bool = True,
+        prune_dist_info: bool = False,
+        exclude_patterns: Optional[List[str]] = None,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -91,6 +111,11 @@ class LambdaDepsBuilder(Construct):
         if uv_binary_path is not None and not uv_binary_path.is_file():
             raise FileNotFoundError(
                 f"uv_binary_path does not exist: {uv_binary_path}"
+            )
+
+        if strip_binary_path is not None and not strip_binary_path.is_file():
+            raise FileNotFoundError(
+                f"strip_binary_path does not exist: {strip_binary_path}"
             )
 
         self._target_architecture = target_architecture
@@ -113,6 +138,13 @@ class LambdaDepsBuilder(Construct):
             if generate_size_report
             else None
         )
+        self._slim_layer = slim_layer
+        self._strip_binaries = strip_binaries
+        self._prune_tests = prune_tests
+        self._prune_dist_info = prune_dist_info
+        self._exclude_patterns = (
+            list(exclude_patterns) if exclude_patterns is not None else []
+        )
 
         if deps_bucket is None:
             deps_bucket = s3.Bucket(
@@ -126,7 +158,9 @@ class LambdaDepsBuilder(Construct):
         self._deps_bucket = deps_bucket
 
         staged_asset_dir = _stage_handler_asset(
-            requirements_txt_file, uv_binary_path=uv_binary_path
+            requirements_txt_file,
+            uv_binary_path=uv_binary_path,
+            strip_binary_path=strip_binary_path,
         )
 
         trigger_env = {
@@ -138,6 +172,11 @@ class LambdaDepsBuilder(Construct):
             "GENERATE_SIZE_REPORT": "1" if self._generate_size_report else "0",
             "TARGET_RUNTIME": target_runtime.name,
             "TARGET_ARCHITECTURE": target_architecture.name,
+            "SLIM_LAYER": "1" if self._slim_layer else "0",
+            "STRIP_BINARIES": "1" if self._strip_binaries else "0",
+            "PRUNE_TESTS": "1" if self._prune_tests else "0",
+            "PRUNE_DIST_INFO": "1" if self._prune_dist_info else "0",
+            "EXCLUDE_PATTERNS": json.dumps(self._exclude_patterns),
         }
         if self._report_key is not None:
             trigger_env["REPORT_OBJECT_KEY"] = self._report_key
@@ -212,6 +251,26 @@ class LambdaDepsBuilder(Construct):
             return None
         return f"s3://{self._deps_bucket.bucket_name}/{self._report_key}"
 
+    @property
+    def slim_layer(self) -> bool:
+        return self._slim_layer
+
+    @property
+    def strip_binaries(self) -> bool:
+        return self._strip_binaries
+
+    @property
+    def prune_tests(self) -> bool:
+        return self._prune_tests
+
+    @property
+    def prune_dist_info(self) -> bool:
+        return self._prune_dist_info
+
+    @property
+    def exclude_patterns(self) -> List[str]:
+        return list(self._exclude_patterns)
+
     def as_layer_version(
         self,
         scope: Construct,
@@ -266,29 +325,37 @@ class LambdaDepsBuilder(Construct):
 def _stage_handler_asset(
     requirements_txt_file: Path,
     uv_binary_path: Optional[Path] = None,
+    strip_binary_path: Optional[Path] = None,
 ) -> str:
     """
-    Copy the in-Lambda handler module and the user's requirements file into a fresh
-    directory so they can be packaged as a single asset. The directory contents
-    determine the asset hash, so changes to requirements.txt re-fire the trigger.
+    Copy the in-Lambda handler module, slimmer module, and the user's requirements
+    file into a fresh directory so they can be packaged as a single asset. The directory
+    contents determine the asset hash, so changes to requirements.txt re-fire the trigger.
 
     If `uv_binary_path` is provided, stages the binary into `bin/uv` within the asset
     directory so it is bundled directly with the trigger function.
+    If `strip_binary_path` is provided, stages the binary into `bin/strip`.
 
     The temp directory is registered for cleanup at process exit, since CDK only
     needs to read it during synth.
 
     :param requirements_txt_file: user-supplied requirements file.
     :param uv_binary_path: optional local pre-compiled Linux uv binary.
+    :param strip_binary_path: optional local pre-compiled Linux strip binary.
     :return: path to the staged directory as a string for `Code.from_asset`.
     """
     staged_dir = Path(tempfile.mkdtemp(prefix="lambda-deps-builder-"))
     atexit.register(shutil.rmtree, staged_dir, ignore_errors=True)
     shutil.copy(_HANDLER_SOURCE_DIR / "handler.py", staged_dir / "handler.py")
     shutil.copy(_HANDLER_SOURCE_DIR / "analyzer.py", staged_dir / "analyzer.py")
+    shutil.copy(_HANDLER_SOURCE_DIR / "slimmer.py", staged_dir / "slimmer.py")
     shutil.copy(requirements_txt_file, staged_dir / "requirements.txt")
     if uv_binary_path is not None:
         bin_dir = staged_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(uv_binary_path, bin_dir / "uv")
+    if strip_binary_path is not None:
+        bin_dir = staged_dir / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(strip_binary_path, bin_dir / "strip")
     return str(staged_dir)
