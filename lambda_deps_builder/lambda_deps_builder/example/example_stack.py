@@ -26,6 +26,7 @@ class ExampleStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
         )
+        CfnOutput(self, "DepsBucketName", value=shared_bucket.bucket_name)
 
         for arch_name, arch in [
             ("X86", lambda_.Architecture.X86_64),
@@ -40,6 +41,9 @@ class ExampleStack(Stack):
                 deps_bucket=shared_bucket,
             )
             layer = builder.as_layer_version(self, f"RequestsLayer{arch_name}")
+
+            if builder.report_key is not None:
+                CfnOutput(self, f"ReportKey{arch_name}", value=builder.report_key)
 
             consumer = lambda_.Function(
                 self,

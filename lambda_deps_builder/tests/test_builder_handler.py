@@ -34,6 +34,7 @@ def _patch_build_paths(
     stage_uv_dir = tmp_path / "uv_bin"
     stage_uv_bin = stage_uv_dir / "uv"
     bundled_uv = tmp_path / "bundled_uv"
+    report_path = tmp_path / "layer-analysis.html"
 
     monkeypatch.setattr(handler_module, "_BUILD_ROOT", build_root)
     monkeypatch.setattr(handler_module, "_ZIP_BASE", zip_base)
@@ -43,6 +44,7 @@ def _patch_build_paths(
     monkeypatch.setattr(handler_module, "_STAGE_UV_DIR", stage_uv_dir)
     monkeypatch.setattr(handler_module, "_STAGE_UV_BIN", stage_uv_bin)
     monkeypatch.setattr(handler_module, "_BUNDLED_UV", bundled_uv)
+    monkeypatch.setattr(handler_module, "_REPORT_PATH", report_path)
     return zip_path, warm_uv_bin, stage_uv_bin, bundled_uv
 
 
@@ -396,4 +398,90 @@ def test_handler_raises_when_env_vars_missing(
 
     with pytest.raises(KeyError):
         handler_module.handler({}, None)
+
+
+def test_handler_generates_and_uploads_size_report_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_boto3: MagicMock,
+    handler_module,
+) -> None:
+    zip_path, warm_uv_bin, _, _ = _patch_build_paths(monkeypatch, handler_module, tmp_path)
+    monkeypatch.setenv("BUCKET_NAME", "my-bucket")
+    monkeypatch.setenv("OBJECT_KEY", "deps.zip")
+    monkeypatch.setenv("BUILD_ENGINE", "pip")
+    monkeypatch.setenv("GENERATE_SIZE_REPORT", "1")
+    monkeypatch.setenv("REPORT_OBJECT_KEY", "layer-analysis.html")
+    monkeypatch.setenv("TARGET_RUNTIME", "python3.12")
+    monkeypatch.setenv("TARGET_ARCHITECTURE", "x86_64")
+
+    def fake_run(cmd, check, env):
+        return _fake_run(
+            cmd,
+            check,
+            env,
+            fixture_files={
+                "demo_pkg/__init__.py": "OK\n",
+                "demo_pkg-1.2.3.dist-info/METADATA": "Name: demo-pkg\nVersion: 1.2.3\n",
+                "demo_pkg-1.2.3.dist-info/RECORD": "demo_pkg/__init__.py,,\n",
+            },
+            warm_uv_bin=warm_uv_bin,
+        )
+
+    monkeypatch.setattr(handler_module.subprocess, "run", fake_run)
+    s3_client = MagicMock(name="s3_client")
+    fake_boto3.client.return_value = s3_client
+
+    result = handler_module.handler({}, None)
+
+    assert s3_client.upload_file.call_count == 2
+    s3_client.upload_file.assert_any_call(str(zip_path), "my-bucket", "deps.zip")
+    report_path = tmp_path / "layer-analysis.html"
+    s3_client.upload_file.assert_any_call(
+        str(report_path),
+        "my-bucket",
+        "layer-analysis.html",
+        ExtraArgs={"ContentType": "text/html; charset=utf-8"},
+    )
+    assert report_path.is_file()
+    html_text = report_path.read_text(encoding="utf-8")
+    assert html_text.startswith("<!DOCTYPE html>")
+    assert "demo-pkg" in html_text
+    assert result["report_key"] == "layer-analysis.html"
+    assert result["unzipped_size"] > 0
+    assert result["package_count"] == 1
+
+
+def test_handler_skips_size_report_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_boto3: MagicMock,
+    handler_module,
+) -> None:
+    zip_path, warm_uv_bin, _, _ = _patch_build_paths(monkeypatch, handler_module, tmp_path)
+    monkeypatch.setenv("BUCKET_NAME", "my-bucket")
+    monkeypatch.setenv("OBJECT_KEY", "deps.zip")
+    monkeypatch.setenv("BUILD_ENGINE", "pip")
+    monkeypatch.setenv("GENERATE_SIZE_REPORT", "0")
+    monkeypatch.setenv("REPORT_OBJECT_KEY", "layer-analysis.html")
+
+    def fake_run(cmd, check, env):
+        return _fake_run(
+            cmd,
+            check,
+            env,
+            fixture_files={"fakepkg/__init__.py": "OK\n"},
+            warm_uv_bin=warm_uv_bin,
+        )
+
+    monkeypatch.setattr(handler_module.subprocess, "run", fake_run)
+    s3_client = MagicMock(name="s3_client")
+    fake_boto3.client.return_value = s3_client
+
+    result = handler_module.handler({}, None)
+
+    s3_client.upload_file.assert_called_once_with(str(zip_path), "my-bucket", "deps.zip")
+    assert "report_key" not in result
+    assert not (tmp_path / "layer-analysis.html").exists()
+
 

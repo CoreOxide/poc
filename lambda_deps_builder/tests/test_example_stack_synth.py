@@ -146,6 +146,9 @@ def test_outputs_expose_consumer_function_names(synthesized_template: dict) -> N
     outputs = synthesized_template.get("Outputs", {})
     assert "ConsumerX86FunctionName" in outputs
     assert "ConsumerArmFunctionName" in outputs
+    assert "DepsBucketName" in outputs
+    assert "ReportKeyX86" in outputs
+    assert "ReportKeyArm" in outputs
 
 
 def test_builder_handler_env_carries_bucket_and_key(synthesized_template: dict) -> None:
@@ -161,3 +164,8 @@ def test_builder_handler_env_carries_bucket_and_key(synthesized_template: dict) 
             "deps-x86_64-RequestsDepsX86.zip",
             "deps-arm64-RequestsDepsArm.zip",
         }, f"{logical_id} unexpected OBJECT_KEY: {env['OBJECT_KEY']}"
+        assert env["GENERATE_SIZE_REPORT"] == "1"
+        assert env["REPORT_OBJECT_KEY"] in {
+            "layer-analysis-x86_64-RequestsDepsX86.html",
+            "layer-analysis-arm64-RequestsDepsArm.html",
+        }, f"{logical_id} unexpected REPORT_OBJECT_KEY: {env['REPORT_OBJECT_KEY']}"

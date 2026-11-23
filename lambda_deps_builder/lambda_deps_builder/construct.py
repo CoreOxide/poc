@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, List, Literal
 
-from aws_cdk import Duration, RemovalPolicy, Size
+from aws_cdk import CfnOutput, Duration, RemovalPolicy, Size
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_s3 as s3
 from aws_cdk import triggers
@@ -49,6 +49,12 @@ class LambdaDepsBuilder(Construct):
         installation.
     :param fallback_to_pip: whether to fall back to standard pip install if uv installation
         or execution fails inside Lambda. Defaults to True.
+    :param generate_size_report: whether to analyze installed package sizes inside Lambda
+        and upload a self-contained interactive HTML treemap report to S3. Defaults to True.
+    :param report_output_key: S3 key for the HTML treemap report. Defaults to
+        ``layer-analysis-{ARCH}-{construct_id}.html``.
+    :param emit_report_cfn_output: whether to emit a CloudFormation Output containing the
+        S3 URI of the generated HTML treemap report. Defaults to True.
     """
 
     def __init__(
@@ -68,6 +74,9 @@ class LambdaDepsBuilder(Construct):
         uv_package_spec: str = "uv",
         uv_binary_path: Optional[Path] = None,
         fallback_to_pip: bool = True,
+        generate_size_report: bool = True,
+        report_output_key: Optional[str] = None,
+        emit_report_cfn_output: bool = True,
     ) -> None:
         super().__init__(scope, construct_id)
 
@@ -94,6 +103,16 @@ class LambdaDepsBuilder(Construct):
         self._build_engine = build_engine
         self._uv_package_spec = uv_package_spec
         self._fallback_to_pip = fallback_to_pip
+        self._generate_size_report = generate_size_report
+        self._report_key: Optional[str] = (
+            (
+                report_output_key
+                if report_output_key is not None
+                else f"layer-analysis-{target_architecture.name}-{construct_id}.html"
+            )
+            if generate_size_report
+            else None
+        )
 
         if deps_bucket is None:
             deps_bucket = s3.Bucket(
@@ -110,6 +129,19 @@ class LambdaDepsBuilder(Construct):
             requirements_txt_file, uv_binary_path=uv_binary_path
         )
 
+        trigger_env = {
+            "BUCKET_NAME": deps_bucket.bucket_name,
+            "OBJECT_KEY": self._deps_key,
+            "BUILD_ENGINE": self._build_engine,
+            "UV_PACKAGE_SPEC": self._uv_package_spec,
+            "FALLBACK_TO_PIP": "1" if self._fallback_to_pip else "0",
+            "GENERATE_SIZE_REPORT": "1" if self._generate_size_report else "0",
+            "TARGET_RUNTIME": target_runtime.name,
+            "TARGET_ARCHITECTURE": target_architecture.name,
+        }
+        if self._report_key is not None:
+            trigger_env["REPORT_OBJECT_KEY"] = self._report_key
+
         self._trigger = triggers.TriggerFunction(
             self,
             "Builder",
@@ -120,15 +152,23 @@ class LambdaDepsBuilder(Construct):
             timeout=build_timeout,
             memory_size=build_memory_mb,
             ephemeral_storage_size=Size.gibibytes(ephemeral_storage_gib),
-            environment={
-                "BUCKET_NAME": deps_bucket.bucket_name,
-                "OBJECT_KEY": self._deps_key,
-                "BUILD_ENGINE": self._build_engine,
-                "UV_PACKAGE_SPEC": self._uv_package_spec,
-                "FALLBACK_TO_PIP": "1" if self._fallback_to_pip else "0",
-            },
+            environment=trigger_env,
         )
         deps_bucket.grant_put(self._trigger, objects_key_pattern=self._deps_key)
+        if self._report_key is not None:
+            deps_bucket.grant_put(self._trigger, objects_key_pattern=self._report_key)
+
+        if (
+            self._generate_size_report
+            and emit_report_cfn_output
+            and self._report_key is not None
+        ):
+            CfnOutput(
+                self,
+                "LayerAnalysisReportUri",
+                value=f"s3://{deps_bucket.bucket_name}/{self._report_key}",
+                description="S3 URI of the interactive HTML layer size treemap report",
+            )
 
     @property
     def target_architecture(self) -> lambda_.Architecture:
@@ -157,6 +197,20 @@ class LambdaDepsBuilder(Construct):
     @property
     def fallback_to_pip(self) -> bool:
         return self._fallback_to_pip
+
+    @property
+    def generate_size_report(self) -> bool:
+        return self._generate_size_report
+
+    @property
+    def report_key(self) -> Optional[str]:
+        return self._report_key
+
+    @property
+    def report_s3_uri(self) -> Optional[str]:
+        if self._report_key is None:
+            return None
+        return f"s3://{self._deps_bucket.bucket_name}/{self._report_key}"
 
     def as_layer_version(
         self,
@@ -231,6 +285,7 @@ def _stage_handler_asset(
     staged_dir = Path(tempfile.mkdtemp(prefix="lambda-deps-builder-"))
     atexit.register(shutil.rmtree, staged_dir, ignore_errors=True)
     shutil.copy(_HANDLER_SOURCE_DIR / "handler.py", staged_dir / "handler.py")
+    shutil.copy(_HANDLER_SOURCE_DIR / "analyzer.py", staged_dir / "analyzer.py")
     shutil.copy(requirements_txt_file, staged_dir / "requirements.txt")
     if uv_binary_path is not None:
         bin_dir = staged_dir / "bin"

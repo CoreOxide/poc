@@ -116,3 +116,23 @@ def test_consumer_can_import_built_dependency(deployed_stack: dict, output_key: 
     payload = json.loads(payload_bytes)
     assert payload["status"] == 200, payload
     assert payload["len"] > 0, payload
+
+
+@pytest.mark.parametrize(
+    ("report_key_output", "expected_arch"),
+    [("ReportKeyX86", "x86_64"), ("ReportKeyArm", "arm64")],
+)
+def test_size_report_html_uploaded_to_s3(
+    deployed_stack: dict, report_key_output: str, expected_arch: str
+) -> None:
+    bucket = deployed_stack["outputs"]["DepsBucketName"]
+    report_key = deployed_stack["outputs"][report_key_output]
+
+    obj = boto3.client("s3", region_name=deployed_stack["region"]).get_object(
+        Bucket=bucket, Key=report_key
+    )
+    assert obj["ContentType"] == "text/html; charset=utf-8"
+    html_body = obj["Body"].read().decode("utf-8")
+    assert html_body.startswith("<!DOCTYPE html>")
+    assert "requests" in html_body
+    assert expected_arch in html_body
